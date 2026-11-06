@@ -1,0 +1,400 @@
+---
+title: "Predicción de puntos en Fórmula 1 mediante regresión logística"
+subtitle: "Proyecto de Análisis Numérico"
+author: "Equipo de trabajo"
+date: "2026-11-06"
+output: word_document
+---
+
+```{r configuracion, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      fig.align = "center")
+```
+
+# Introducción
+
+Se utiliza un modelo Logit en R para predecir si un piloto consigue puntos en un Gran Premio, con información disponible antes de la carrera.
+
+**Variable respuesta:** $Y=1$ si consigue puntos y $Y=0$ si no consigue puntos.
+
+$$
+P(Y=1\mid X)=\frac{1}{1+e^{-(\beta_0+\beta_1X_1+\beta_2X_2+\beta_3X_3)}}
+$$
+
+# 1. Instalación de paquetes
+
+```{r paquetes}
+# install.packages("dplyr")
+# install.packages("httr2")
+# install.packages("jsonlite")
+# install.packages("slider")
+# install.packages("ggplot2")
+# install.packages("pROC")
+# install.packages("knitr")
+# install.packages("rmarkdown")
+
+library(dplyr)
+library(httr2)
+library(jsonlite)
+library(slider)
+library(ggplot2)
+library(pROC)
+library(knitr)
+```
+
+# 2. Carga de datos
+
+Fuente: API <https://api.jolpi.ca/>. Se utilizan las temporadas 2014–2025 y se guarda una copia local en `data/resultados_f1.csv`.
+
+```{r descarga}
+# Carpeta de datos
+if (!dir.exists("data")) {
+  dir.create("data")
+}
+
+archivo_csv <- "data/resultados_f1.csv"
+archivo_rds <- "data/resultados.rds"
+
+# Consulta a la API
+pedir_pagina <- function(anio, offset) {
+  direccion <- paste0("https://api.jolpi.ca/ergast/f1/", anio,
+                      "/results.json")
+
+  respuesta <- request(direccion) |>
+    req_url_query(limit = 100, offset = offset) |>
+    req_retry(max_tries = 5) |>
+    req_perform()
+
+  fromJSON(resp_body_string(respuesta), simplifyVector = FALSE)$MRData
+}
+
+# Convertir JSON a tabla
+convertir_pagina <- function(mr) {
+  registros <- list()
+
+  for (carrera in mr$RaceTable$Races) {
+    for (piloto in carrera$Results) {
+      registros[[length(registros) + 1]] <- data.frame(
+        season = as.integer(carrera$season),
+        round = as.integer(carrera$round),
+        date = as.character(carrera$date),
+        race_name = as.character(carrera$raceName),
+        circuit_id = as.character(carrera$Circuit$circuitId),
+        driver_id = as.character(piloto$Driver$driverId),
+        constructor_id = as.character(piloto$Constructor$constructorId),
+        grid = as.integer(piloto$grid),
+        points = as.numeric(piloto$points),
+        status = as.character(piloto$status),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  bind_rows(registros)
+}
+
+# Descargar una temporada
+descargar_temporada <- function(anio) {
+  paginas <- list()
+  offset <- 0
+
+  repeat {
+    Sys.sleep(0.6)
+    mr <- pedir_pagina(anio, offset)
+    paginas[[length(paginas) + 1]] <- convertir_pagina(mr)
+
+    offset <- offset + 100
+    if (offset >= as.integer(mr$total)) break
+  }
+
+  bind_rows(paginas)
+}
+
+# Leer datos locales o descargar
+if (file.exists(archivo_csv)) {
+  Base <- read.csv(archivo_csv, stringsAsFactors = FALSE)
+} else if (file.exists(archivo_rds)) {
+  Base <- readRDS(archivo_rds)
+  write.csv(Base, archivo_csv, row.names = FALSE)
+} else {
+  temporadas <- 2014:2025
+  Base <- bind_rows(lapply(temporadas, descargar_temporada))
+  write.csv(Base, archivo_csv, row.names = FALSE)
+}
+
+head(Base)
+```
+
+## Verificación de los datos
+
+```{r verificacion}
+columnas <- c("season", "round", "date", "driver_id",
+              "constructor_id", "grid", "points", "status")
+
+if (!all(columnas %in% names(Base))) {
+  stop("La base de datos no contiene todas las columnas necesarias.")
+}
+
+Base$season <- as.integer(Base$season)
+Base$round <- as.integer(Base$round)
+Base$date <- as.Date(Base$date)
+Base$grid <- as.integer(Base$grid)
+Base$points <- as.numeric(Base$points)
+
+Base <- Base |>
+  filter(season >= 2014, season <= 2025) |>
+  arrange(date, round, driver_id)
+
+if (anyDuplicated(Base[c("season", "round", "driver_id")]) > 0) {
+  stop("Se encontraron pilotos duplicados en una misma carrera.")
+}
+
+resumen_base <- data.frame(
+  Registros = nrow(Base),
+  Carreras = n_distinct(paste(Base$season, Base$round)),
+  Temporada_inicial = min(Base$season),
+  Temporada_final = max(Base$season)
+)
+
+kable(resumen_base)
+```
+
+# 3. Preparación de los datos
+
+## Variable respuesta
+
+Se excluyen los pilotos que no iniciaron la carrera. `en_puntos = 1` cuando `points > 0`.
+
+```{r variable-respuesta}
+Base <- Base |>
+  filter(!status %in% c("Did not start", "Withdrawn",
+                        "Did not qualify", "Did not prequalify")) |>
+  filter(!is.na(grid), !is.na(points), !is.na(date)) |>
+  mutate(en_puntos = ifelse(points > 0, 1, 0)) |>
+  group_by(season, round) |>
+  mutate(grid_ajustada = ifelse(grid > 0, grid,
+                                max(grid, na.rm = TRUE) + 1)) |>
+  ungroup()
+
+# Frecuencias
+kable(as.data.frame(table(Base$en_puntos)),
+      col.names = c("En puntos (0 o 1)", "Frecuencia"))
+```
+
+## Variables predictoras
+
+Se consideran la posición de salida, el rendimiento del piloto en sus últimas cinco carreras y los puntos previos promedio del equipo.
+
+```{r variables-piloto}
+# Últimas cinco carreras previas
+Base <- Base |>
+  arrange(date, round, driver_id) |>
+  group_by(driver_id) |>
+  mutate(
+    forma_piloto5 = lag(slide_dbl(en_puntos, mean, .before = 4))
+  ) |>
+  ungroup()
+
+# Pilotos sin historial
+Base$forma_piloto5[is.na(Base$forma_piloto5)] <- 0.5
+```
+
+```{r variables-equipo}
+# Puntos del equipo por carrera
+Equipo <- Base |>
+  group_by(season, round, constructor_id) |>
+  summarise(puntos_carrera = sum(points), .groups = "drop") |>
+  arrange(season, round) |>
+  group_by(season, constructor_id) |>
+  mutate(
+    carreras_anteriores = row_number() - 1,
+    puntos_anteriores = cumsum(puntos_carrera) - puntos_carrera,
+    promedio_equipo = puntos_anteriores / pmax(carreras_anteriores, 1)
+  ) |>
+  ungroup() |>
+  select(season, round, constructor_id, promedio_equipo)
+
+Base <- Base |>
+  left_join(Equipo, by = c("season", "round", "constructor_id"))
+
+# Variables del modelo
+Datos <- Base |>
+  select(season, round, date, driver_id, constructor_id,
+         en_puntos, grid_ajustada, forma_piloto5, promedio_equipo) |>
+  na.omit()
+
+head(Datos)
+```
+
+# 4. División de los datos
+
+Entrenamiento: **2015–2023**. Prueba: **2024–2025**.
+
+```{r particion}
+Entrenamiento <- Datos |>
+  filter(season >= 2015, season <= 2023)
+
+Prueba <- Datos |>
+  filter(season >= 2024, season <= 2025)
+
+if (nrow(Entrenamiento) == 0 || nrow(Prueba) == 0) {
+  stop("Faltan temporadas para construir entrenamiento y prueba.")
+}
+
+kable(data.frame(
+  Conjunto = c("Entrenamiento", "Prueba"),
+  Temporadas = c("2015 a 2023", "2024 a 2025"),
+  Observaciones = c(nrow(Entrenamiento), nrow(Prueba))
+))
+
+kable(as.data.frame(table(Entrenamiento$en_puntos)),
+      col.names = c("En puntos", "Frecuencia en entrenamiento"))
+```
+
+## Gráfica descriptiva
+
+```{r grafica-parrilla}
+Por_parrilla <- Entrenamiento |>
+  filter(grid_ajustada <= 20) |>
+  group_by(grid_ajustada) |>
+  summarise(prob_observada = mean(en_puntos), .groups = "drop")
+
+ggplot(Por_parrilla,
+       aes(x = grid_ajustada, y = prob_observada)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Proporción de pilotos que consiguen puntos",
+       x = "Posición de salida", y = "Proporción observada") +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_minimal()
+```
+
+# 5. Modelo Logit
+
+```{r modelo-logit}
+modelo.logit <- glm(
+  en_puntos ~ grid_ajustada + forma_piloto5 + promedio_equipo,
+  data = Entrenamiento,
+  family = binomial(link = "logit")
+)
+
+summary(modelo.logit)
+```
+
+## Coeficientes
+
+Los odds ratios se obtienen con `exp(coef())`.
+
+```{r interpretacion}
+# Coeficientes y odds ratios
+kable(data.frame(
+  Variable = names(coef(modelo.logit)),
+  Coeficiente = round(as.numeric(coef(modelo.logit)), 4),
+  Odds_ratio = round(as.numeric(exp(coef(modelo.logit))), 4)
+))
+
+# Prueba de verosimilitud
+anova(modelo.logit, test = "Chisq")
+```
+
+# 6. Predicciones y evaluación
+
+Clasificación inicial: probabilidad mayor o igual a 0.50.
+
+```{r prediccion}
+probabilidades <- predict(modelo.logit,
+                          newdata = Prueba,
+                          type = "response")
+
+prediccion <- ifelse(probabilidades >= 0.50, 1, 0)
+
+# Matriz de confusión
+matriz <- table(
+  Prediccion = factor(prediccion, levels = c(0, 1)),
+  Realidad = factor(Prueba$en_puntos, levels = c(0, 1))
+)
+
+kable(matriz)
+```
+
+## Métricas
+
+```{r metricas}
+real <- Prueba$en_puntos
+VP <- sum(prediccion == 1 & real == 1)
+VN <- sum(prediccion == 0 & real == 0)
+FP <- sum(prediccion == 1 & real == 0)
+FN <- sum(prediccion == 0 & real == 1)
+
+exactitud <- (VP + VN) / length(real)
+precision <- VP / max(VP + FP, 1)
+sensibilidad <- VP / max(VP + FN, 1)
+especificidad <- VN / max(VN + FP, 1)
+
+curva_roc <- roc(response = real, predictor = probabilidades,
+                 levels = c(0, 1), direction = "<", quiet = TRUE)
+valor_auc <- as.numeric(auc(curva_roc))
+
+Metricas <- data.frame(
+  Metrica = c("Exactitud", "Precisión", "Sensibilidad",
+              "Especificidad", "AUC"),
+  Valor = round(c(exactitud, precision, sensibilidad,
+                  especificidad, valor_auc), 4)
+)
+
+kable(Metricas)
+```
+
+## Curva ROC
+
+```{r curva-roc}
+plot(curva_roc, col = "blue", lwd = 2, identity = TRUE,
+     main = "Curva ROC: predicción de puntos en F1")
+```
+
+## Comparación con la parrilla
+
+```{r comparacion}
+prediccion_base <- ifelse(Prueba$grid_ajustada <= 10, 1, 0)
+exactitud_base <- mean(prediccion_base == Prueba$en_puntos)
+
+Comparacion <- data.frame(
+  Metodo = c("Parrilla: primeros 10", "Modelo Logit"),
+  Exactitud = round(c(exactitud_base, exactitud), 4)
+)
+
+kable(Comparacion)
+```
+
+## Ejemplo de predicciones
+
+```{r ejemplo-predicciones}
+Resultados_prueba <- Prueba
+Resultados_prueba$probabilidad <- probabilidades
+Resultados_prueba$prediccion <- prediccion
+
+ultima_fecha <- max(Resultados_prueba$date)
+
+Ejemplo <- Resultados_prueba |>
+  filter(date == ultima_fecha) |>
+  arrange(desc(probabilidad)) |>
+  select(driver_id, constructor_id, grid_ajustada, en_puntos,
+         probabilidad, prediccion)
+
+Ejemplo$probabilidad <- round(Ejemplo$probabilidad, 4)
+
+kable(Ejemplo)
+```
+
+# 7. Resultados y conclusiones
+
+En **2024–2025** se evaluaron `r nrow(Prueba)` registros. La exactitud del modelo fue **`r round(100 * exactitud, 2)`%**, frente al **`r round(100 * exactitud_base, 2)`%** de la regla de parrilla. El AUC fue **`r round(valor_auc, 4)`**.
+
+El modelo estima probabilidades, no resultados seguros. Accidentes, estrategias y condiciones de carrera pueden afectar la predicción.
+
+La estimación en `glm()` emplea métodos numéricos iterativos (IRLS), relacionados con los métodos de optimización de Análisis Numérico.
+
+# Fuentes
+
+- API Jolpica-F1: <https://api.jolpi.ca/>
+- R, función `glm()`: <https://stat.ethz.ch/R-manual/R-devel/library/stats/html/glm.html>
+- Material de clase: `Logit.Rmd` y `modelo logit.Rmd`.
