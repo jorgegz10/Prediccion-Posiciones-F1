@@ -1,0 +1,297 @@
+---
+title: "Predicción de la posición final de los pilotos de Fórmula 1 con Machine Learning"
+subtitle: "Avance del proyecto"
+author: "Jorge Esteban Gomez y ... y ..."
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 150)
+```
+
+# Introducción
+
+Este proyecto construye un modelo de **regresión** que predice la **posición final de cada piloto de Fórmula 1 en una carrera**, usando solo información disponible **antes** de que comience. Se usa **un solo modelo para todo el campeonato**, con validación temporal (se entrena con el pasado y se prueba con el futuro) para evitar la fuga de información.
+
+**Pregunta de investigación:** ¿se puede predecir la posición final con la parrilla, la forma reciente, el rendimiento del equipo y el historial en el circuito, y se supera el baseline de "el piloto termina donde largó"?
+
+Este avance cubre la descarga de los datos, su limpieza, la construcción de las variables y el inicio del modelado.
+
+```{r paquetes}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+library(slider)
+library(tidymodels)
+
+tidymodels_prefer()
+conflicted::conflicts_prefer(dplyr::lag, dplyr::lead)
+set.seed(2024)
+```
+
+# Datos
+
+## Descarga desde la API
+
+Los datos vienen de la API gratuita **Jolpica-F1** (sucesora de Ergast): parrilla, posición final, puntos, equipo y estado de llegada de cada piloto en cada carrera. Se descargan las temporadas **2014 a 2025**; 2014 solo sirve para que las variables de historial tengan información en 2015. El resultado se guarda en `data/resultados.rds` para no repetir la descarga.
+
+```{r descarga}
+dir.create("data", showWarnings = FALSE)
+
+SEASONS <- 2014:2025
+BASE    <- "https://api.jolpi.ca/ergast/f1"
+
+pedir_pagina <- function(season, offset) {
+  Sys.sleep(0.5)  # la API limita las peticiones por segundo
+  request(BASE) |>
+    req_url_path_append(as.character(season), "results.json") |>
+    req_url_query(limit = 100, offset = offset) |>
+    req_retry(max_tries = 6, backoff = ~ 5) |>
+    req_perform() |>
+    resp_body_string()
+}
+
+parsear_pagina <- function(txt) {
+  mr <- fromJSON(txt, simplifyVector = FALSE)$MRData
+
+  filas <- map(mr$RaceTable$Races, function(r) {
+    map(r$Results, function(x) {
+      tibble(
+        season         = as.integer(r$season),
+        round          = as.integer(r$round),
+        race_name      = r$raceName,
+        circuit_id     = r$Circuit$circuitId,
+        date           = as.Date(r$date),
+        driver_id      = x$Driver$driverId,
+        driver_name    = paste(x$Driver$givenName, x$Driver$familyName),
+        constructor_id = x$Constructor$constructorId,
+        grid           = as.integer(x$grid),
+        position_text  = x$positionText,
+        points         = as.numeric(x$points),
+        status         = x$status
+      )
+    })
+  }) |>
+    list_flatten() |>
+    list_rbind()
+
+  list(total = as.integer(mr$total), filas = filas)
+}
+
+descargar_temporada <- function(season) {
+  message("Descargando temporada ", season)
+  offset <- 0
+  paginas <- list()
+  repeat {
+    p <- parsear_pagina(pedir_pagina(season, offset))
+    paginas[[length(paginas) + 1]] <- p$filas
+    offset <- offset + 100
+    if (offset >= p$total) break
+  }
+  list_rbind(paginas)
+}
+
+if (!file.exists("data/resultados.rds")) {
+  resultados <- SEASONS |>
+    map(descargar_temporada) |>
+    list_rbind() |>
+    # La API entrega los resultados en orden de llegada (incluyendo abandonos),
+    # así que el orden de aparición es la posición final.
+    group_by(season, round) |>
+    mutate(position_order = row_number()) |>
+    ungroup() |>
+    mutate(
+      dnf = !(status == "Finished" |
+                str_detect(status, "^\\+\\d+ Lap") |
+                status == "Lapped")
+    )
+  saveRDS(resultados, "data/resultados.rds")
+}
+
+resultados <- readRDS("data/resultados.rds")
+```
+
+## Verificación y limpieza
+
+Se revisa el tamaño de la base, que no haya valores faltantes y que el orden de aparición coincida con la posición oficial en los pilotos clasificados (el valor debe ser cercano a 1). Un abandono (`dnf`) es todo piloto que no terminó la carrera ni terminó con vueltas de diferencia.
+
+```{r verificacion}
+resultados |>
+  summarise(filas = n(),
+            carreras = n_distinct(season, round),
+            pilotos = n_distinct(driver_id),
+            equipos = n_distinct(constructor_id),
+            pct_abandonos = round(mean(dnf), 3),
+            faltantes = sum(is.na(pick(everything()))),
+            coincide_posicion = round(mean(
+              as.integer(position_text[str_detect(position_text, "^\\d+$")]) ==
+                position_order[str_detect(position_text, "^\\d+$")]), 4)) |>
+  knitr::kable()
+```
+
+## Parrilla de salida vs. posición final
+
+Se observa qué tanto explica la parrilla el resultado final. Los puntos cerca de la línea punteada son pilotos que terminaron donde largaron; si la relación es fuerte, el baseline será difícil de superar.
+
+```{r eda-parrilla}
+resultados |>
+  filter(grid > 0, position_order <= 20, grid <= 20) |>
+  ggplot(aes(grid, position_order)) +
+  geom_jitter(alpha = 0.08, width = 0.25, height = 0.25) +
+  geom_smooth(method = "gam", color = "red", se = FALSE) +
+  geom_abline(linetype = "dashed") +
+  labs(title = "Parrilla de salida vs. posición final",
+       x = "Posición de parrilla", y = "Posición final")
+```
+
+# Construcción de variables
+
+Se crean variables que resumen el estado del piloto y del equipo **antes** de cada carrera. Todas las estadísticas móviles se desplazan con `lag()`, de modo que la carrera que se predice nunca entra en sus propias variables.
+
+| Variable | Descripción |
+|---|---|
+| `grid_adj`, `pit_start` | Parrilla de salida y si salió desde el pit lane |
+| `driver_form5`, `team_form5` | Posición promedio del piloto y del equipo en las últimas 5 carreras |
+| `form_vs_team` | Forma del piloto menos la de su equipo |
+| `driver_dnf10` | Tasa de abandonos del piloto en sus últimas 10 carreras |
+| `driver_pts_per_race`, `team_pts_per_race` | Puntos por carrera en la temporada, antes de la carrera |
+| `circ_hist` | Promedio histórico del piloto en ese circuito, suavizado hacia su forma general |
+| `is_street`, `new_driver`, `round`, `n_cars` | Circuito urbano, piloto sin historial, fecha y cantidad de autos |
+
+```{r features}
+# Forma del piloto y puntos acumulados antes de cada carrera
+res <- resultados |>
+  arrange(date, position_order) |>
+  group_by(driver_id) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(
+    driver_n_prev = row_number() - 1,
+    driver_form5  = lag(slide_dbl(position_order, mean, .before = 4)),
+    driver_dnf10  = lag(slide_dbl(as.numeric(dnf), mean, .before = 9))
+  ) |>
+  ungroup() |>
+  group_by(season, driver_id) |>
+  arrange(round, .by_group = TRUE) |>
+  mutate(driver_pts_before = cumsum(points) - points) |>
+  ungroup()
+
+# Forma del equipo
+equipo <- res |>
+  group_by(constructor_id, season, round, date) |>
+  summarise(team_pos = mean(position_order),
+            team_pts = sum(points),
+            .groups = "drop") |>
+  group_by(constructor_id) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(team_form5 = lag(slide_dbl(team_pos, mean, .before = 4))) |>
+  ungroup() |>
+  group_by(season, constructor_id) |>
+  arrange(round, .by_group = TRUE) |>
+  mutate(team_pts_before = cumsum(team_pts) - team_pts) |>
+  ungroup() |>
+  select(constructor_id, season, round, team_form5, team_pts_before)
+
+res <- res |>
+  left_join(equipo, by = c("constructor_id", "season", "round"))
+
+# Historial en el circuito
+res <- res |>
+  group_by(driver_id, circuit_id) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(
+    circ_n_prev    = row_number() - 1,
+    circ_mean_prev = lag(cummean(position_order))
+  ) |>
+  ungroup()
+
+CIRCUITOS_URBANOS <- c("monaco", "marina_bay", "baku", "jeddah", "vegas",
+                       "miami", "albert_park", "villeneuve", "sochi", "valencia")
+```
+
+Los pilotos y equipos sin historial reciben una posición neutra (10.5, el punto medio de la parrilla). El promedio del circuito se suaviza hacia la forma general del piloto, con peso `K_SUAVIZADO`, porque pocas carreras en una pista dan un promedio poco confiable.
+
+```{r features-finales}
+PUNTO_MEDIO <- 10.5
+K_SUAVIZADO <- 2
+
+features <- res |>
+  group_by(season, round) |>
+  mutate(n_cars = n()) |>
+  ungroup() |>
+  mutate(
+    new_driver          = driver_n_prev == 0,
+    driver_form5        = coalesce(driver_form5, PUNTO_MEDIO),
+    team_form5          = coalesce(team_form5, PUNTO_MEDIO),
+    driver_dnf10        = coalesce(driver_dnf10, mean(dnf, na.rm = TRUE)),
+    pit_start           = grid == 0,
+    grid_adj            = if_else(grid == 0, n_cars, grid),
+    form_vs_team        = driver_form5 - team_form5,
+    driver_pts_per_race = driver_pts_before / pmax(round - 1, 1),
+    team_pts_per_race   = team_pts_before   / pmax(round - 1, 1),
+    circ_hist = if_else(
+      circ_n_prev == 0, driver_form5,
+      (circ_n_prev * circ_mean_prev + K_SUAVIZADO * driver_form5) /
+        (circ_n_prev + K_SUAVIZADO)
+    ),
+    is_street = circuit_id %in% CIRCUITOS_URBANOS
+  ) |>
+  select(season, round, date, race_name, circuit_id, driver_id, driver_name,
+         constructor_id, position_order, dnf,
+         grid_adj, pit_start, driver_form5, team_form5, form_vs_team,
+         driver_dnf10, driver_pts_per_race, team_pts_per_race,
+         circ_hist, is_street, new_driver, n_cars)
+```
+
+# Modelado (primera etapa)
+
+## Partición temporal y preprocesamiento
+
+Se entrena con las temporadas **2015 a 2023** y se prueba con **2024 y 2025**. Una validación aleatoria mezclaría carreras futuras con pasadas y sobreestimaría el desempeño. La receta elimina variables sin variación y normaliza las numéricas.
+
+```{r particion}
+df <- features |>
+  filter(season >= 2015) |>
+  arrange(date, position_order) |>
+  mutate(across(c(pit_start, is_street, new_driver), as.numeric))
+
+TEST_DESDE <- 2024
+train <- df |> filter(season <  TEST_DESDE)
+test  <- df |> filter(season >= TEST_DESDE)
+
+rec <- recipe(
+  position_order ~ grid_adj + pit_start + driver_form5 + team_form5 +
+    form_vs_team + driver_dnf10 + driver_pts_per_race + team_pts_per_race +
+    circ_hist + is_street + new_driver + round + n_cars,
+  data = train
+) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+c(filas_train = nrow(train), filas_test = nrow(test))
+```
+
+## Primer modelo: regresión lineal
+
+Como punto de partida se ajusta una regresión lineal y se compara con el baseline **"termina donde largó"** (predecir que la posición final es igual a la de parrilla). RMSE y MAE están en puestos (menos es mejor); R² indica la variación explicada (más es mejor).
+
+```{r modelo-lm}
+fit_lm <- workflow() |>
+  add_recipe(rec) |>
+  add_model(linear_reg() |> set_engine("lm")) |>
+  fit(data = train)
+
+test_pred <- test |>
+  mutate(.pred = predict(fit_lm, new_data = test)$.pred)
+
+metricas <- metric_set(rmse, mae, rsq)
+
+bind_rows(
+  baseline_parrilla = metricas(test_pred, truth = position_order, estimate = grid_adj),
+  regresion_lineal  = metricas(test_pred, truth = position_order, estimate = .pred),
+  .id = "modelo"
+) |>
+  select(modelo, metrica = .metric, valor = .estimate) |>
+  pivot_wider(names_from = metrica, values_from = valor) |>
+  knitr::kable(digits = 3)
+```
